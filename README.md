@@ -94,14 +94,124 @@ Everything lives under `~/.devctl/`:
 - **GitPython** — dotfile sync
 - **tomli / tomli-w** — TOML config
 
-## Roadmap
+# devctl — performance patterns to apply to every command module
 
-- [x] Week 1 — scaffold + `jump`
-- [x] Week 2 — `sync` (dotfile manager)
-- [x] Week 3 — `snapshot` + `restore`
-- [x] Week 4 — `secret` vault + polish
-- [ ] Publish to PyPI, tag `v1.0.0`, demo GIF
+## What was slow and why
 
+Python imports are *synchronous and transitive*. When `cli.py` does:
+
+```python
+from .commands import env, jump, secret, snapshot, sync
+```
+
+…Python immediately imports all five modules **and every module they import**.
+So if `snapshot.py` imports `tarfile`, `hashlib`, and `shutil` at the top, those
+are loaded even when you run `devctl version`.
+
+For a CLI tool, startup time is the most felt latency. Every 30 ms of unnecessary
+import adds up.
+
+---
+
+## The three fixes (already applied to cli.py, jump.py, db.py)
+
+### 1. Lazy subcommand loading in cli.py ✅
+`cli.py` now reads `sys.argv[1]` before importing anything and only loads the
+one module the user actually invoked. `devctl jump foo` never imports
+`snapshot.py`, `sync.py`, or `secret.py`.
+
+### 2. Defer heavy imports to inside command functions ✅ (applied to jump.py)
+Move all non-typer imports from module level to inside the function body.
+Python caches imports in `sys.modules`, so the **second call is free**;
+only the first call pays the import cost once.
+
+### 3. SQLite connection reuse + WAL mode in db.py ✅
+Open the connection once per process (module-level singleton). WAL mode
+allows reads to proceed concurrently with a write, and `SYNCHRONOUS=NORMAL`
+skips the expensive fsync on every commit without risking corruption.
+
+---
+
+## Pattern to apply to env.py, sync.py, secret.py, snapshot.py
+
+**Before:**
+```python
+# env.py (current pattern)
+import subprocess
+import shutil
+from pathlib import Path
+from rich.console import Console
+from rich.table import Table
+import typer
+from .. import db
+
+console = Console()
+app = typer.Typer(help="…")
+
+@app.command()
+def add(path: str = typer.Argument(…)):
+    p = Path(path)
+    …
+```
+
+**After:**
+```python
+# env.py (optimized)
+from __future__ import annotations
+import typer
+
+app = typer.Typer(help="…")   # ← only typer at module level
+
+@app.command()
+def add(path: str = typer.Argument(…)):
+    # All heavy imports go HERE, inside the function.
+    # Python caches them after the first call — no repeated cost.
+    import subprocess
+    import shutil
+    from pathlib import Path
+    from rich.console import Console
+    from rich.table import Table
+    from .. import db
+
+    console = Console()
+    p = Path(path)
+    …
+```
+
+The rule: **if something is only needed when a specific command runs, it
+belongs inside that command function, not at the top of the file.**
+
+Typer itself must stay at module level because `app = typer.Typer()` and the
+`@app.command()` decorators are evaluated at import time (cli.py needs them to
+build the command tree).
+
+---
+
+## Quick-win checklist for each remaining file
+
+| File            | Likely heavy imports to move inside functions       |
+|-----------------|-----------------------------------------------------|
+| `env.py`        | `subprocess`, `shutil`, `pathlib`, `rich.table`     |
+| `sync.py`       | `subprocess`, `shutil`, `pathlib`, `git` / `pygit2` |
+| `secret.py`     | `keyring`, `cryptography`, `base64`                 |
+| `snapshot.py`   | `tarfile`, `hashlib`, `shutil`, `pathlib`, `json`   |
+
+---
+
+## Expected speedup
+
+| Command                  | Before (est.) | After (est.) |
+|--------------------------|--------------|--------------|
+| `devctl version`         | ~300 ms      | ~80 ms       |
+| `devctl jump foo`        | ~300 ms      | ~100 ms      |
+| `devctl --help`          | ~300 ms      | ~300 ms      |
+| `devctl snapshot`        | ~300 ms      | ~120 ms      |
+
+`--help` stays the same because it must load all subcommands to print them.
+All targeted invocations become significantly faster.
+
+(Times are rough estimates; actual numbers depend on your machine and which
+third-party packages each command imports.)
 ## License
 
 MIT
